@@ -36,11 +36,29 @@ Workflow：[`.github/workflows/specula.yml`](.github/workflows/specula.yml)，�
 
 Specula 建議至少 32 GB RAM；HDDS-15926 的 run 用 `--tlc-memory-limit=28G`，
 單一目標要跑 1.5–5.5 小時。所以在 `ubuntu-latest` 上預設值收斂成：
-TLC 10G、3 個 worker、一次 1 個 agent、Specula 跑 320 分鐘後停下來上傳結果。
-範圍窄的目標可以跑完；範圍大的目標建議用 self-hosted runner：
+TLC 10G、3 個 worker、一次 1 個 agent。
+要更多記憶體可以用 self-hosted runner：
 在 repo 的 Settings → Actions → Runners 註冊一台 Linux（或裝了 GNU coreutils 的 macOS）機器，
 觸發時把 `runner` 設成它的 label，再調高 `tlc_memory_limit`、`tlc_worker_limit`
 和 `time_limit_minutes`。
+
+### 超過 6 小時：自動接力
+
+整個 Specula run 沒有時間上限，但 GitHub 的 job 最多跑 6 小時，所以會分段跑：
+
+1. 每段跑 `time_limit_minutes`（預設 320 分鐘），時間到就停下 Specula，
+   把 run 目錄和 Claude 的對話紀錄存成 artifact `specula-state`（保留 7 天）。
+2. 同一個 workflow run 裡的 `next` job 再觸發一次 workflow，帶上 `resume_run=<這次的 run id>`，
+   並把 `ozone_ref` 固定成這段用的 commit。
+3. 下一段還原狀態，用 `specula run --run-id=<id>` 從停下的 phase 接著跑，直到 Specula 跑完或出錯。
+
+每一段都是一個新的 workflow run，標題是 `Specula <target> (continues run <id>)`；
+每段的結果 artifact 是到那段為止的結果，看最後一段的就好。
+停下時正在跑的那個 TLC model check 或 agent 指令不會保留，下一段會重做。
+不想再接下去時，取消正在跑的那段即可。
+
+存檔和結果上傳之前，會先檢查裡面有沒有出現 Claude 的 API key 或 OAuth token；
+有的話整段都不上傳，接力也停下來。
 
 ## 跑一個目標
 
@@ -62,6 +80,8 @@ gh workflow run specula.yml -R chungen0126/ozone-specula \
 | `model` / `effort` | `claude-opus-5-5[1m]` / `medium` | 帳號沒有 1M context 時改成 `claude-opus-5-5` |
 | `reviews_and_debate` | `true` | `--enable-reviews --confirm-debate`，跟 HDDS-15926 一致 |
 | `specula_ref` | 固定的 Specula commit | 要更新 Specula 時改這裡 |
+| `time_limit_minutes` | `320` | 每一段的長度，見「超過 6 小時：自動接力」 |
+| `resume_run` | 空 | 由上一段自動帶入，手動觸發時不用填 |
 
 看進度：
 

@@ -1,4 +1,5 @@
 name: Specula run
+run-name: Specula ${{ inputs.target }}${{ inputs.resume_run != '' && format(' (continues run {0})', inputs.resume_run) || '' }}
 
 # Runs one Specula target (TLA+ spec generation, model checking, trace
 # validation and bug confirmation) against an Ozone checkout.
@@ -61,9 +62,13 @@ on:
         type: string
         default: e616bdae7b4eea622f8248ead79b9f8937c29fe7
       time_limit_minutes:
-        description: Stop Specula after this many minutes so the results can still be uploaded
+        description: Length of one segment. At this limit the run is saved and continued by a new workflow run
         type: number
         default: 320
+      resume_run:
+        description: Workflow run ID whose saved Specula run to continue (set by the previous segment)
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -73,8 +78,14 @@ jobs:
     runs-on: ${{ inputs.runner }}
     # GitHub-hosted jobs are killed at 360 minutes.
     timeout-minutes: ${{ inputs.runner == 'ubuntu-latest' && 355 || 4320 }}
+    permissions:
+      contents: read
+      # Download the saved run from the previous segment.
+      actions: read
+    outputs:
+      continue: ${{ steps.specula.outputs.continue }}
+      ozone_sha: ${{ steps.inputs.outputs.ozone_sha }}
     env:
-      RUN_ID: gh-${{ github.run_id }}-${{ github.run_attempt }}
       SPECULA_HOME: ${{ github.workspace }}/specula
       OZONE_DIR: ${{ github.workspace }}/ozone
       CONFIG_DIR: ${{ github.workspace }}/config
@@ -113,6 +124,7 @@ jobs:
           persist-credentials: false
 
       - name: Check inputs and credentials
+        id: inputs
         env:
           GUIDANCE: ${{ inputs.guidance }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -128,6 +140,28 @@ jobs:
           fi
           echo "Ozone commit: $(git -C "$OZONE_DIR" rev-parse HEAD)"
           echo "Specula commit: $(git -C "$SPECULA_HOME" rev-parse HEAD)"
+          # The next segment checks out this commit, even if ozone_ref has moved since.
+          echo "ozone_sha=$(git -C "$OZONE_DIR" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the previous segment
+        env:
+          RESUME_RUN: ${{ inputs.resume_run }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ -z "$RESUME_RUN" ]]; then
+            echo "RUN_ID=gh-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          state="$RUNNER_TEMP/specula-state"
+          gh run download "$RESUME_RUN" -R "$GITHUB_REPOSITORY" -n specula-state -D "$state"
+          run_id="$(cat "$state/run-id.txt")"
+          # The archive holds absolute paths, which are the same on every GitHub-hosted runner.
+          tar --zstd -xpf "$state/state.tar.zst" -C /
+          rm -rf "$state"
+          [[ -d "$SPECULA_HOME/runs/$run_id" ]] || { echo "::error::Restored state has no run $run_id"; exit 1; }
+          echo "RUN_ID=$run_id" >> "$GITHUB_ENV"
+          echo "RESUMING=true" >> "$GITHUB_ENV"
+          echo "Continuing Specula run $run_id from workflow run $RESUME_RUN"
 
       - uses: actions/setup-java@v4
         with:
@@ -163,6 +197,7 @@ jobs:
         run: mvn -B -q install -DskipTests -DskipShade -DskipRecon
 
       - name: Run Specula
+        id: specula
         working-directory: specula
         env:
           TARGET: ${{ inputs.target }}
@@ -192,13 +227,22 @@ jobs:
           if [[ "$REVIEWS_AND_DEBATE" == true ]]; then
             args+=(--enable-reviews --confirm-debate)
           fi
+          if [[ "${RESUMING:-}" == true ]]; then
+            # Specula restores the run's settings and continues its unfinished phase.
+            args=(--run-id="$RUN_ID")
+          else
+            args+=("$TARGET|apache/ozone|Java|Use the target-specific guidance")
+          fi
+          start=$SECONDS
           set +e
-          timeout --signal=INT --kill-after=5m "${TIME_LIMIT_MINUTES}m" \
-            specula run "${args[@]}" "$TARGET|apache/ozone|Java|Use the target-specific guidance"
+          timeout --signal=INT --kill-after=5m "${TIME_LIMIT_MINUTES}m" specula run "${args[@]}"
           rc=$?
           set -e
-          if [[ $rc -eq 124 ]]; then
-            echo "::warning::Specula stopped at the ${TIME_LIMIT_MINUTES} minute limit; results are partial."
+          # Specula may exit with 124, 130 or 137 when stopped, so check the elapsed time instead of the exit code.
+          if (( SECONDS - start >= TIME_LIMIT_MINUTES * 60 )); then
+            echo "::notice::Specula reached the ${TIME_LIMIT_MINUTES} minute segment limit (exit $rc); a new workflow run continues it."
+            echo "continue=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           exit $rc
 
@@ -228,11 +272,88 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload results
+      - name: Save state for the next segment
+        if: steps.specula.outputs.continue == 'true'
+        run: |
+          state="$RUNNER_TEMP/specula-state"
+          mkdir -p "$state" "$HOME/.claude/projects"
+          echo "$RUN_ID" > "$state/run-id.txt"
+          # The run directory, and the Claude conversations that Specula resumes with `claude --resume`.
+          # TLC state directories only serve a model check in progress, which does not survive the stop.
+          tar --zstd -cpf "$state/state.tar.zst" -C / --exclude='*/spec/states' \
+            "${SPECULA_HOME#/}/runs/$RUN_ID" "${HOME#/}/.claude/projects"
+          du -sh "$state/state.tar.zst"
+
+      # Artifacts of a public repository are public, and the saved state holds whole Claude conversations.
+      - name: Check for leaked credentials
+        id: leakcheck
         if: always()
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          for secret in "$ANTHROPIC_API_KEY" "$CLAUDE_CODE_OAUTH_TOKEN"; do
+            [[ -n "$secret" ]] || continue
+            for dir in "$RUNNER_TEMP/specula-out" "$SPECULA_HOME/runs/${RUN_ID:-}" "$HOME/.claude/projects"; do
+              if [[ -d "$dir" ]] && grep -rqF -- "$secret" "$dir"; then
+                echo "::error::A Claude credential appears under $dir, so nothing is uploaded."
+                exit 1
+              fi
+            done
+          done
+
+      - name: Upload results
+        if: always() && steps.leakcheck.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: specula-${{ inputs.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/specula-out
+          # Specula writes its results under <target>/.specula-output, which is skipped without this.
+          include-hidden-files: true
           if-no-files-found: warn
           retention-days: 30
+
+      - name: Upload state for the next segment
+        if: steps.specula.outputs.continue == 'true' && steps.leakcheck.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: specula-state
+          path: ${{ runner.temp }}/specula-state
+          if-no-files-found: error
+          # Already compressed with zstd.
+          compression-level: 0
+          retention-days: 7
+
+  # Continues the run in a new workflow run, since a GitHub-hosted job stops after 6 hours.
+  next:
+    needs: specula
+    if: needs.specula.outputs.continue == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Start the next segment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ inputs.target }}
+          GUIDANCE: ${{ inputs.guidance }}
+          OZONE_REPO: ${{ inputs.ozone_repo }}
+          OZONE_SHA: ${{ needs.specula.outputs.ozone_sha }}
+          RUNNER_LABEL: ${{ inputs.runner }}
+          MODEL: ${{ inputs.model }}
+          EFFORT: ${{ inputs.effort }}
+          TLC_MEMORY_LIMIT: ${{ inputs.tlc_memory_limit }}
+          TLC_WORKER_LIMIT: ${{ inputs.tlc_worker_limit }}
+          MAX_PARALLEL: ${{ inputs.max_parallel }}
+          REVIEWS_AND_DEBATE: ${{ inputs.reviews_and_debate }}
+          PREBUILD: ${{ inputs.prebuild }}
+          SPECULA_REF: ${{ inputs.specula_ref }}
+          TIME_LIMIT_MINUTES: ${{ inputs.time_limit_minutes }}
+        run: |
+          gh workflow run specula.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
+            -f target="$TARGET" -f guidance="$GUIDANCE" -f ozone_repo="$OZONE_REPO" -f ozone_ref="$OZONE_SHA" \
+            -f runner="$RUNNER_LABEL" -f model="$MODEL" -f effort="$EFFORT" \
+            -f tlc_memory_limit="$TLC_MEMORY_LIMIT" -f tlc_worker_limit="$TLC_WORKER_LIMIT" \
+            -f max_parallel="$MAX_PARALLEL" -f reviews_and_debate="$REVIEWS_AND_DEBATE" -f prebuild="$PREBUILD" \
+            -f specula_ref="$SPECULA_REF" -f time_limit_minutes="$TIME_LIMIT_MINUTES" -f resume_run="$GITHUB_RUN_ID"
+          echo "Started the next segment, which continues from run $GITHUB_RUN_ID." >> "$GITHUB_STEP_SUMMARY"
