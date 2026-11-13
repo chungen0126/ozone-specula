@@ -235,8 +235,24 @@ jobs:
           fi
           start=$SECONDS
           set +e
-          timeout --signal=INT --kill-after=5m "${TIME_LIMIT_MINUTES}m" specula run "${args[@]}"
+          # Every process of this run inherits the marker, including the agents and TLC that Specula starts in their
+          # own sessions, which outlive Specula when it is stopped.
+          marker="SPECULA_SEGMENT=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          env "$marker" timeout --signal=INT --kill-after=5m "${TIME_LIMIT_MINUTES}m" specula run "${args[@]}"
           rc=$?
+          # Stop them before the results and the state are copied, so that the files no longer change.
+          leftovers() { grep -lzx -- "$marker" /proc/[0-9]*/environ 2>/dev/null | cut -d/ -f3; }
+          pids=$(leftovers)
+          if [[ -n "$pids" ]]; then
+            echo "Stopping $(wc -w <<<"$pids") processes left by Specula"
+            kill -INT $pids 2>/dev/null
+            for _ in $(seq 30); do
+              sleep 2
+              pids=$(leftovers)
+              [[ -n "$pids" ]] || break
+            done
+            [[ -z "$pids" ]] || kill -KILL $pids 2>/dev/null
+          fi
           set -e
           # Specula may exit with 124, 130 or 137 when stopped, so check the elapsed time instead of the exit code.
           if (( SECONDS - start >= TIME_LIMIT_MINUTES * 60 )); then
@@ -280,8 +296,14 @@ jobs:
           echo "$RUN_ID" > "$state/run-id.txt"
           # The run directory, and the Claude conversations that Specula resumes with `claude --resume`.
           # TLC state directories only serve a model check in progress, which does not survive the stop.
+          # Exit code 1 only means a file changed while it was read, e.g. by a process that ignored the stop.
+          # That file may be incomplete, but losing the whole state over it would lose the run.
           tar --zstd -cpf "$state/state.tar.zst" -C / --exclude='*/spec/states' \
-            "${SPECULA_HOME#/}/runs/$RUN_ID" "${HOME#/}/.claude/projects"
+            "${SPECULA_HOME#/}/runs/$RUN_ID" "${HOME#/}/.claude/projects" || {
+            rc=$?
+            [[ $rc -eq 1 ]] || exit $rc
+            echo "::warning::Some files changed while the state was saved."
+          }
           du -sh "$state/state.tar.zst"
 
       # Artifacts of a public repository are public, and the saved state holds whole Claude conversations.
